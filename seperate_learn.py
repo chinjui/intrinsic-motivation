@@ -49,6 +49,7 @@ parser.add_argument('--dyn-grad-norm-max', type=float, default=5)
 parser.add_argument('--gamma', type=float, default=0.9)
 parser.add_argument('--use-gae', action='store_true')
 parser.add_argument('--gae-lambda', type=float, default=0.95)
+parser.add_argument('--draw-near-interval', type=int, default=3)
 parser.add_argument('--share-optim', action='store_true')
 parser.add_argument('--predict-delta-obs', action='store_true')
 parser.add_argument('--use-linear-lr-decay', action='store_true')
@@ -230,7 +231,7 @@ if __name__ == '__main__':
         episode_length_intr = []
         intrinsic_rewards_intr = []
         solved_episodes_intr = []
-
+        obs_replay_buffer = deque()
 
         for step in range(args.num_steps):
             # render
@@ -280,7 +281,7 @@ if __name__ == '__main__':
         agent_intr.compute_returns(args.gamma, args.use_gae, args.gae_lambda)
 
         # draw extrinsic and intrinsic policy closer
-        if update % 5 == 0:
+        if update % args.draw_near_interval == 0:
           obs_from_both = torch.cat([agent_extr.rollouts.obs, agent_intr.rollouts.obs], dim=1).view(-1, *envs_extr.observation_space.shape)
           random_perm = torch.randperm(obs_from_both.shape[0])
           obs_from_both = obs_from_both[random_perm]
