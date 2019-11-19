@@ -76,6 +76,7 @@ def add_figure(tag, figure, global_step=None, close=True, walltime=None):
     WRITER.add_figure(tag, figure, global_step, close, walltime)
 
 def add_video(tag, vid_tensor, global_step=None, fps=4, walltime=None):
+    print('writer', WRITER)
     assert WRITER is not None, "call configure to initialize SummaryWriter"
     WRITER.add_video(tag, vid_tensor, global_step, fps, walltime)
 

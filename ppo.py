@@ -32,11 +32,16 @@ class PPO():
                  predict_delta_obs=False,
                  device='cpu',
                  share_optim=False,
-                 debug=False):
+                 debug=False,
+                 use_extrinsic_reward=True):
 
         # setup logging
-        self.checkpoint_path = os.path.join(log_dir, 'checkpoint.pth')
-        self.checkpoint_path2 = os.path.join(log_dir, 'checkpoint2.pth')
+        if use_extrinsic_reward:
+          postfix = 'extrinsic'
+        else:
+          postfix = 'intrinsic'
+        self.checkpoint_path = os.path.join(log_dir, 'checkpoint_%s.pth' % postfix)
+        self.checkpoint_path2 = os.path.join(log_dir, 'checkpoint2%s.pth' % postfix)
 
         # ppo hyperparameters
         self.clip_param = clip_param
@@ -74,6 +79,7 @@ class PPO():
                                                  hidden_size=hidden_size,
                                                  num_outputs=observation_space.shape[0])
             self.dynamics_model.to(device)
+        self.use_extrinsic_reward = use_extrinsic_reward
 
         # setup optimizers
         self.share_optim = share_optim
@@ -122,6 +128,8 @@ class PPO():
     def compute_returns(self, gamma, use_gae=True, gae_lambda=0.95):
         with torch.no_grad():
             next_value = self.actor_critic.get_value(self.rollouts.obs[-1]).detach()
+        if not self.use_extrinsic_reward:
+          self.rollouts.rewards[:] = 0.
         if self.add_intrinsic_reward:
             self.rollouts.rewards += self.rollouts.intrinsic_rewards
         self.rollouts.compute_returns(next_value, gamma, use_gae, gae_lambda)

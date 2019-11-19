@@ -27,6 +27,11 @@ class ActorCritic(nn.Module):
         dist_entropy = dist.entropy().mean()
         return value, action, action_log_probs
 
+    def select_action_distr(self, obs):
+        value, actor_features = self.value_fn(obs), self.policy(obs)
+        dist = self.policy.dist(actor_features)
+        return dist
+
     def evaluate_action(self, obs, action):
         value, actor_features = self.value_fn(obs), self.policy(obs)
 

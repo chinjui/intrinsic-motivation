@@ -31,7 +31,7 @@ parser.add_argument('--add-intrinsic-reward', action='store_true')
 parser.add_argument('--intrinsic-coef', type=float, default=1.0)
 parser.add_argument('--max-intrinsic-reward', type=float, default=None)
 parser.add_argument('--num-env-steps', type=int, default=int(1e7))
-parser.add_argument('--num-processes', type=int, default=4)
+parser.add_argument('--num-processes', type=int, default=32)
 parser.add_argument('--num-steps', type=int, default=2048)
 parser.add_argument('--ppo-epochs', type=int, default=10)
 parser.add_argument('--dyn-epochs', type=int, default=5)
@@ -127,8 +127,11 @@ if __name__ == '__main__':
     start = time.time()
 
     num_updates = int(args.num_env_steps // args.num_processes // args.num_steps)
+    print("Number of updates:", num_updates)
 
     for update in range(num_updates):
+        need_record_video = update % 15 == 0
+
         # decrease learning rate linearly
         if args.use_linear_lr_decay:
             if args.share_optim:
@@ -151,11 +154,13 @@ if __name__ == '__main__':
         episode_length = []
         intrinsic_rewards = []
         solved_episodes = []
+        frames = []
 
         for step in range(args.num_steps):
             # render
-            if args.render:
-                envs.render()
+            if args.render and need_record_video:
+                frame = envs.render(mode='rgb_array')
+                frames.append(frame)
 
             # select action
             value, action, action_log_probs = agent.select_action(step)
@@ -170,7 +175,7 @@ if __name__ == '__main__':
                     intrinsic_reward = torch.clamp(agent.compute_intrinsic_reward(step), 0.0, args.max_intrinsic_reward)
             else:
                 intrinsic_reward = torch.tensor(0).view(1, 1)
-            intrinsic_rewards.extend(list(intrinsic_reward.numpy().reshape(-1)))
+            intrinsic_rewards.extend(list(intrinsic_reward.cpu().numpy().reshape(-1)))
 
             # store experience
             agent.store_rollout(obs[1], action, action_log_probs,
@@ -183,6 +188,13 @@ if __name__ == '__main__':
                     extrinsic_rewards.append(info['episode']['r'])
                     episode_length.append(info['episode']['l'])
                     solved_episodes.append(info['is_success'])
+                    if len(frames) != 0 and need_record_video:
+                        frames = np.stack(frames)[None, :]
+                        frames = np.swapaxes(frames, 2, 4)
+                        frames = np.swapaxes(frames, 3, 4)
+                        logger.add_video('video', frames, global_step=update)
+                        frames = []
+                        need_record_video = False
 
         # compute returns
         agent.compute_returns(args.gamma, args.use_gae, args.gae_lambda)
