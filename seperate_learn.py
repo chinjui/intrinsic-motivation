@@ -39,7 +39,6 @@ parser.add_argument('--num-mini-batch', type=int, default=32)
 parser.add_argument('--pi-lr', type=float, default=1e-4)
 parser.add_argument('--v-lr', type=float, default=1e-3)
 parser.add_argument('--dyn-lr', type=float, default=1e-3)
-parser.add_argument('--closer-lr', type=float, default=1e-3)
 parser.add_argument('--hidden-size', type=int, default=128)
 parser.add_argument('--clip-param', type=float, default=0.3)
 parser.add_argument('--value-coef', type=float, default=0.5)
@@ -49,7 +48,11 @@ parser.add_argument('--dyn-grad-norm-max', type=float, default=5)
 parser.add_argument('--gamma', type=float, default=0.9)
 parser.add_argument('--use-gae', action='store_true')
 parser.add_argument('--gae-lambda', type=float, default=0.95)
-parser.add_argument('--draw-near-interval', type=int, default=3)
+parser.add_argument('--draw-near-coef', type=float, default=1e-3)
+# parser.add_argument('--draw-near-interval', type=int, default=3)
+parser.add_argument('--draw-near-batch-size', type=int, default=256)
+parser.add_argument('--draw-near-interval', type=int, default=10)
+parser.add_argument('--draw-near-begin-update', type=int, default=32)
 parser.add_argument('--share-optim', action='store_true')
 parser.add_argument('--predict-delta-obs', action='store_true')
 parser.add_argument('--use-linear-lr-decay', action='store_true')
@@ -152,10 +155,19 @@ if __name__ == '__main__':
                 debug=args.debug,
                 use_extrinsic_reward=False)
 
+    # let extrinsic and intrinsic model know each other
+    agent_extr.opposite_model = agent_intr
+    agent_intr.opposite_model = agent_extr
+    agent_extr.draw_near_batch_size = args.draw_near_batch_size
+    agent_intr.draw_near_batch_size = args.draw_near_batch_size
+    agent_extr.draw_near_begin_update = args.draw_near_begin_update
+    agent_intr.draw_near_begin_update = args.draw_near_begin_update
+    agent_extr.draw_near_interval = args.draw_near_interval
+    agent_intr.draw_near_interval = args.draw_near_interval
 
     # optimizer to draw extrinsic and intrinsic policies closer
-    closer_optim_extr = optim.Adam(agent_extr.actor_critic.policy.parameters(), args.closer_lr)
-    closer_optim_intr = optim.Adam(agent_intr.actor_critic.policy.parameters(), args.closer_lr)
+    # closer_optim_extr = optim.Adam(agent_extr.actor_critic.policy.parameters(), args.closer_lr)
+    # closer_optim_intr = optim.Adam(agent_intr.actor_critic.policy.parameters(), args.closer_lr)
 
     # reset envs and initialize rollouts
     obs_extr = envs_extr.reset()
@@ -213,15 +225,17 @@ if __name__ == '__main__':
                                              initial_lr=args.v_lr)
 
         # linear decay the learning rate of draw closer optimizer
-        utils.update_linear_schedule(optimizer=closer_optim_extr,
-                                     update=update,
-                                     total_num_updates=num_updates,
-                                     initial_lr=args.closer_lr)
-        utils.update_linear_schedule(optimizer=closer_optim_intr,
-                                     update=update,
-                                     total_num_updates=num_updates,
-                                     initial_lr=args.closer_lr)
-
+        # utils.update_linear_schedule(optimizer=closer_optim_extr,
+        #                              update=update,
+        #                              total_num_updates=num_updates,
+        #                              initial_lr=args.closer_lr)
+        # utils.update_linear_schedule(optimizer=closer_optim_intr,
+        #                              update=update,
+        #                              total_num_updates=num_updates,
+        #                              initial_lr=args.closer_lr)
+        draw_near_coef = args.draw_near_coef - (args.draw_near_coef * (update / float(num_updates)))
+        agent_extr.draw_near_coef = draw_near_coef
+        agent_intr.draw_near_coef = draw_near_coef
 
         extrinsic_rewards_extr = []
         episode_length_extr = []
@@ -231,7 +245,13 @@ if __name__ == '__main__':
         episode_length_intr = []
         intrinsic_rewards_intr = []
         solved_episodes_intr = []
-        obs_replay_buffer = deque()
+
+        # replay buffer for calculating kl-div between extrinsic and intrinsic model
+        n_episodes_to_save = 2 * args.draw_near_begin_update
+        obs_replay_buffer = torch.zeros((args.num_steps + 1) * n_episodes_to_save, *envs_extr.observation_space.shape).to(device)
+        replay_buffer_pointer = 0
+        agent_extr.obs_replay_buffer = obs_replay_buffer
+        agent_intr.obs_replay_buffer = obs_replay_buffer
 
         for step in range(args.num_steps):
             # render
@@ -276,39 +296,49 @@ if __name__ == '__main__':
                     episode_length_intr.append(info['episode']['l'])
                     solved_episodes_intr.append(info['is_success'])
 
+        # store observation for calculating kl-div
+        obs_replay_buffer[replay_buffer_pointer * (args.num_steps+1): (replay_buffer_pointer+1) * (args.num_steps+1)] = \
+            agent_extr.rollouts.obs[:, random.randrange(args.num_processes)]
+        replay_buffer_pointer = (replay_buffer_pointer + 1) % n_episodes_to_save
+        obs_replay_buffer[replay_buffer_pointer * (args.num_steps+1): (replay_buffer_pointer+1) * (args.num_steps+1)] = \
+            agent_intr.rollouts.obs[:, random.randrange(args.num_processes)]
+        replay_buffer_pointer = (replay_buffer_pointer + 1) % n_episodes_to_save
+
         # compute returns
         agent_extr.compute_returns(args.gamma, args.use_gae, args.gae_lambda)
         agent_intr.compute_returns(args.gamma, args.use_gae, args.gae_lambda)
 
         # draw extrinsic and intrinsic policy closer
-        if update % args.draw_near_interval == 0:
-          obs_from_both = torch.cat([agent_extr.rollouts.obs, agent_intr.rollouts.obs], dim=1).view(-1, *envs_extr.observation_space.shape)
-          random_perm = torch.randperm(obs_from_both.shape[0])
-          obs_from_both = obs_from_both[random_perm]
-          bsize = 64
-          divs_extr = []
-          divs_intr = []
-          for i in range(obs_from_both.shape[0] // bsize):
-            obs_feed = obs_from_both[bsize*i:bsize*(i+1)]
-            out_extr = agent_extr.actor_critic.select_action_distr(obs_feed)
-            out_intr = agent_intr.actor_critic.select_action_distr(obs_feed)
-            closer_optim_extr.zero_grad()
-            closer_optim_intr.zero_grad()
-            div_extr = torch.distributions.kl.kl_divergence(out_extr, out_intr).mean()
-            div_intr = torch.distributions.kl.kl_divergence(out_intr, out_extr).mean()
-            div_extr.backward(retain_graph=True)
-            div_intr.backward()
-            closer_optim_extr.step()
-            closer_optim_intr.step()
-            divs_extr.append(div_extr)
-            divs_intr.append(div_intr)
+        # if update % args.draw_near_interval == 0 and update >= args.draw_near_begin_update:
+        #   obs_from_both = torch.cat([agent_extr.rollouts.obs, agent_intr.rollouts.obs], dim=1).view(-1, *envs_extr.observation_space.shape)
+        #   random_perm = torch.randperm(obs_from_both.shape[0])
+        #   obs_from_both = obs_from_both[random_perm]
+        #   bsize = 64
+        #   divs_extr = []
+        #   divs_intr = []
+        #   for i in range(obs_from_both.shape[0] // bsize):
+        #     obs_feed = obs_from_both[bsize*i:bsize*(i+1)]
+        #     out_extr = agent_extr.actor_critic.select_action_distr(obs_feed)
+        #     out_intr = agent_intr.actor_critic.select_action_distr(obs_feed)
+        #     closer_optim_extr.zero_grad()
+        #     closer_optim_intr.zero_grad()
+        #     div_extr = torch.distributions.kl.kl_divergence(out_extr, out_intr).mean()
+        #     div_intr = torch.distributions.kl.kl_divergence(out_intr, out_extr).mean()
+        #     div_extr.backward(retain_graph=True)
+        #     div_intr.backward()
+        #     closer_optim_extr.step()
+        #     closer_optim_intr.step()
+        #     divs_extr.append(div_extr)
+        #     divs_intr.append(div_intr)
 
 
 
         # update policy and value_fn, reset rollout storage
-        tot_loss_extr, pi_loss_extr, v_loss_extr, dyn_loss_extr, entropy_extr, kl_extr, delta_p_extr, delta_v_extr = \
+        agent_extr.update_index = update
+        agent_intr.update_index = update
+        tot_loss_extr, pi_loss_extr, v_loss_extr, dyn_loss_extr, entropy_extr, kl_extr, delta_p_extr, delta_v_extr, two_model_kl_extr = \
             agent_extr.update(obs_mean=obs_extr[2], obs_var=obs_extr[3])
-        tot_loss_intr, pi_loss_intr, v_loss_intr, dyn_loss_intr, entropy_intr, kl_intr, delta_p_intr, delta_v_intr = \
+        tot_loss_intr, pi_loss_intr, v_loss_intr, dyn_loss_intr, entropy_intr, kl_intr, delta_p_intr, delta_v_intr, two_model_kl_intr = \
             agent_intr.update(obs_mean=obs_intr[2], obs_var=obs_intr[3])
 
         # log data
@@ -372,8 +402,8 @@ if __name__ == '__main__':
             # logger.logkv('Value/Median', np.median(agent.rollouts.value_preds.cpu().data.numpy()))
             # logger.logkv('Value/Min', np.min(agent.rollouts.value_preds.cpu().data.numpy()))
             # logger.logkv('Value/Max', np.max(agent.rollouts.value_preds.cpu().data.numpy()))
-            logger.logkv('KLDivergence_extr', np.mean(torch.stack(divs_extr).mean().cpu().data.numpy()))
-            logger.logkv('KLDivergence_intr', np.mean(torch.stack(divs_intr).mean().cpu().data.numpy()))
+            logger.logkv('KLDivergence_extr', two_model_kl_extr)
+            logger.logkv('KLDivergence_intr', two_model_kl_intr)
 
             if args.use_tensorboard:
                 # logs for extrinsic model

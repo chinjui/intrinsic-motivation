@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.optim as optim
+import random
 
 from rollouts import Rollouts
 
@@ -147,10 +148,10 @@ class PPO():
     def update(self, obs_mean, obs_var):
         self.obs_mean = obs_mean
         self.obs_var = obs_var
-        tot_loss, pi_loss, v_loss, dyn_loss, ent, kl, delta_p, delta_v = self._update()
+        tot_loss, pi_loss, v_loss, dyn_loss, ent, kl, delta_p, delta_v, two_model_kl = self._update()
 
         self.rollouts.after_update()
-        return tot_loss, pi_loss, v_loss, dyn_loss, ent, kl, delta_p, delta_v
+        return tot_loss, pi_loss, v_loss, dyn_loss, ent, kl, delta_p, delta_v, two_model_kl
 
     def compute_loss(self, sample):
         # get sample batch
@@ -213,12 +214,26 @@ class PPO():
         dynamics_loss_epoch = 0
         entropy_epoch = 0
         kl_epoch = 0
+        two_model_kl_epoch = 0
+        div = torch.Tensor([0.])
 
         for epoch in range(self.ppo_epochs):
             data_generator = self.rollouts.feed_forward_generator(advantages, self.num_mini_batch)
 
             for sample in data_generator:
                 total_loss, policy_loss, value_loss, dynamics_loss, entropy, kl = self.compute_loss(sample)
+
+                # kl-div to draw extrinsic and intrinsic policy nearer
+                if self.update_index >= self.draw_near_begin_update and self.update_index % self.draw_near_interval == 0:
+                    sample_indices = random.sample(range(self.obs_replay_buffer.shape[0]), self.draw_near_batch_size)
+                    obs_feed = self.obs_replay_buffer[sample_indices]
+                    out_self = self.actor_critic.select_action_distr(obs_feed)
+                    out_opposite = self.opposite_model.actor_critic.select_action_distr(obs_feed)
+                    div = torch.distributions.kl.kl_divergence(out_opposite, out_self).mean()
+                    if self.share_optim:
+                        total_loss += self.draw_near_coef * div
+                    else:
+                        policy_loss += self.draw_near_coef * div
 
                 if self.share_optim:
                     self.optimizer.zero_grad()
@@ -253,6 +268,7 @@ class PPO():
                 dynamics_loss_epoch += dynamics_loss.item()
                 entropy_epoch += entropy.item()
                 kl_epoch += kl.item()
+                two_model_kl_epoch += div.item()
 
         num_updates = (self.ppo_epochs + 1) * self.num_mini_batch
         total_loss_epoch /= num_updates
@@ -261,6 +277,7 @@ class PPO():
         dynamics_loss_epoch /= num_updates
         entropy_epoch /= num_updates
         kl_epoch /= num_updates
+        two_model_kl_epoch /= num_updates
 
 
         # policy and value losses after gradient update
@@ -269,7 +286,7 @@ class PPO():
             delta_p = policy_loss_new - policy_loss_old
             delta_v = value_loss_new - value_loss_old
 
-        return total_loss_epoch, policy_loss_epoch, value_loss_epoch, dynamics_loss_epoch, entropy_epoch, kl_epoch, delta_p.item(), delta_v.item()
+        return total_loss_epoch, policy_loss_epoch, value_loss_epoch, dynamics_loss_epoch, entropy_epoch, kl_epoch, delta_p.item(), delta_v.item(), two_model_kl_epoch
 
     def save_checkpoint(self, path=None):
         # create checkpoint dict
